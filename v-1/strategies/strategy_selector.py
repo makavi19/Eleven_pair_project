@@ -29,23 +29,23 @@ class StrategyRecommendation:
     strategy_name: str
     symbol: str
     direction: str
-    
+
     # The actual trade signal
     signal: StrategySignal
-    
+
     # Selection reasoning
     regime_match_score: float          # How well strategy fits regime
     session_match_score: float         # How well strategy fits session
     pair_match_score: float            # How well strategy fits pair
     overall_score: float               # Combined score
-    
+
     # Risk
     risk_tier: str
     risk_usd: float
-    
+
     # Alternative options (if this one rejected)
     alternatives: List[Tuple[str, str, float]] = field(default_factory=list)  # [(strategy, pair, score), ...]
-    
+
     # Rejection reason (if not selected)
     rejection_reason: Optional[str] = None
 
@@ -53,7 +53,7 @@ class StrategyRecommendation:
 class StrategySelector:
     """
     The "Brain" of the trading bot.
-    
+
     Workflow:
     1. Detect market regime for each pair (RegimeDetector)
     2. Ask ALL 9 strategies to analyze their preferred pairs
@@ -64,14 +64,14 @@ class StrategySelector:
        - Signal quality (15%): Grade, confidence, R:R
     4. Pick the HIGHEST scored signal that passes Sheriff/Risk checks
     5. Return StrategyRecommendation with full details
-    
+
     NOT random - purely data-driven selection.
     """
-    
+
     def __init__(self, bridge: Optional[MT5Bridge] = None):
         self.bridge = bridge or get_bridge()
         self.regime_detector = RegimeDetector(bridge)
-        
+
         # Instantiate all 9 strategies
         self.strategies = {
             'ict_ob_fvg': ICTOBFVG(bridge),
@@ -84,7 +84,7 @@ class StrategySelector:
             'breakout_momentum': BreakoutMomentum(bridge),
             'crt_multitimeframe': CRTMultitimeframe(bridge),
         }
-        
+
         # Strategy metadata for scoring
         self.strategy_meta = {
             'ict_ob_fvg': {
@@ -133,7 +133,7 @@ class StrategySelector:
                 'pairs': ['EURUSD', 'GBPUSD', 'XAUUSD'],
             },
         }
-    
+
     def select_best_trade(
         self,
         dxy_directions: Dict[str, str],
@@ -142,30 +142,30 @@ class StrategySelector:
     ) -> List[StrategyRecommendation]:
         """
         Main entry point: Find the BEST trade opportunity across all 9 strategies and 11 pairs.
-        
+
         Returns ranked list of StrategyRecommendation (top 3 candidates).
         """
         if current_session is None:
             current_session = session_mgr.get_current_session().value
-        
+
         # Get active pairs for this session
         active_pairs = session_mgr.get_active_pairs()
-        
+
         all_signals = []
-        
+
         # === PHASE 1: Detect regime for each pair ===
         regime_readings = {}
         for symbol in active_pairs:
             regime_readings[symbol] = self.regime_detector.analyze_pair(symbol)
-        
+
         # === PHASE 2: Run ALL strategies on ALL pairs ===
         for symbol in active_pairs:
             dxy_dir = dxy_directions.get(symbol, 'neutral')
             if dxy_dir == 'neutral':
                 continue
-            
+
             regime = regime_readings[symbol]
-            
+
             # Fetch data once per pair
             try:
                 m15 = self.bridge.get_historical_data(symbol, 'M15', 100)
@@ -173,12 +173,12 @@ class StrategySelector:
                 h4 = self.bridge.get_historical_data(symbol, 'H4', 30)
             except Exception as e:
                 continue
-            
+
             # Ask each strategy to analyze
             for strat_name, strategy in self.strategies.items():
                 try:
                     signal = strategy.detect_setup(symbol, dxy_dir, m15, h1, h4)
-                    
+
                     if signal.valid and signal.is_tradeable:
                         # Score this signal
                         score = self._score_signal(
@@ -188,32 +188,32 @@ class StrategySelector:
                             regime=regime,
                             current_session=current_session
                         )
-                        
+
                         all_signals.append((score, strat_name, symbol, signal))
-                        
+
                 except Exception as e:
                     # Strategy failed on this pair, continue
                     continue
-        
+
         # === PHASE 3: Rank and select top candidates ===
         if not all_signals:
             return []
-        
+
         # Sort by score descending
         all_signals.sort(key=lambda x: x[0], reverse=True)
-        
+
         # Build recommendations
         recommendations = []
         for i, (score, strat_name, symbol, signal) in enumerate(all_signals[:max_candidates]):
-            
+
             # Get alternatives (next best options)
             alternatives = [
                 (s[1], s[2], s[0]) for s in all_signals[max_candidates:max_candidates+3]
             ]
-            
+
             # Risk assignment
             risk_tier, risk_usd = self._assign_risk(signal)
-            
+
             rec = StrategyRecommendation(
                 selected=(i == 0),  # Top candidate is "selected"
                 strategy_name=strat_name,
@@ -229,11 +229,11 @@ class StrategySelector:
                 alternatives=alternatives,
                 rejection_reason=None if i == 0 else f"Lower score ({score:.3f}) vs top ({all_signals[0][0]:.3f})"
             )
-            
+
             recommendations.append(rec)
-        
+
         return recommendations
-    
+
     def _score_signal(
         self,
         signal: StrategySignal,
@@ -244,7 +244,7 @@ class StrategySelector:
     ) -> float:
         """
         Calculate composite score for a strategy-signal combination.
-        
+
         Weights:
         - Regime fit: 40% (most important - strategy must match market)
         - Signal quality: 25% (grade, confidence, R:R)
@@ -253,20 +253,20 @@ class StrategySelector:
         """
         # 1. Regime match (40%)
         regime_score = self._regime_score(strat_name, regime.regime.value)
-        
+
         # 2. Signal quality (25%)
         quality_score = (
             signal.confidence * 0.4 +           # Confidence weight
             (1.0 if signal.grade in ['A+', 'A'] else 0.7 if signal.grade in ['B+', 'B'] else 0.3) * 0.35 +
             min(1.0, signal.risk_reward / 3.0) * 0.25  # R:R capped at 3.0
         )
-        
+
         # 3. Session fit (20%)
         session_score = self._session_score(strat_name, current_session)
-        
+
         # 4. Pair fit (15%)
         pair_score = self._pair_score(strat_name, symbol)
-        
+
         # Weighted total
         total = (
             regime_score * 0.40 +
@@ -274,39 +274,39 @@ class StrategySelector:
             session_score * 0.20 +
             pair_score * 0.15
         )
-        
+
         return total
-    
+
     def _regime_score(self, strat_name: str, regime: str) -> float:
         """Score how well strategy fits current market regime (0-1)"""
         meta = self.strategy_meta.get(strat_name, {})
         best_regimes = meta.get('regimes', [])
-        
+
         if regime in best_regimes:
             return 1.0
-        
+
         # Partial match: strategy works in some conditions
         return 0.4
-    
+
     def _session_score(self, strat_name: str, session: str) -> float:
         """Score how well strategy fits current session (0-1)"""
         meta = self.strategy_meta.get(strat_name, {})
         sessions = meta.get('sessions', [])
-        
+
         if 'all' in sessions or session in sessions:
             return 1.0
-        
+
         # Partial: strategy works in some sessions
         return 0.5
-    
+
     def _pair_score(self, strat_name: str, symbol: str) -> float:
         """Score how well pair fits strategy (0-1)"""
         meta = self.strategy_meta.get(strat_name, {})
         pairs = meta.get('pairs', [])
-        
+
         if symbol in pairs:
             return 1.0
-        
+
         # Check pair category
         pair_config = get_pair_config(symbol)
         if pair_config:
@@ -316,15 +316,15 @@ class StrategySelector:
             # Core pairs
             if symbol in ['GBPUSD', 'EURJPY', 'USDJPY']:
                 return 0.7
-        
+
         return 0.5
-    
+
     def _assign_risk(self, signal: StrategySignal) -> Tuple[str, float]:
         """Assign risk tier based on signal characteristics"""
         # Use signal's own recommendation if valid
         if signal.risk_tier in ['tight', 'normal', 'wide']:
             return signal.risk_tier, signal.recommended_risk_usd
-        
+
         # Fallback: calculate from stop pips
         if signal.stop_pips <= 12:
             return 'tight', 4.0
@@ -332,13 +332,13 @@ class StrategySelector:
             return 'normal', 7.0
         else:
             return 'wide', 10.0
-    
+
     def get_strategy_for_regime(self, regime: str) -> List[str]:
         """Get strategies ranked for a specific regime"""
         regime_enum = MarketRegime(regime)
         strategies = self.regime_detector.REGIME_STRATEGY_MAP.get(regime_enum, [])
         return [s[0] for s in strategies]
-    
+
     def quick_check(
         self,
         symbol: str,
@@ -347,7 +347,7 @@ class StrategySelector:
     ) -> Optional[StrategySignal]:
         """
         Quick check: Run ONE strategy on ONE pair (for manual override or testing).
-        
+
         If strategy_hint provided, use that strategy.
         Otherwise, detect regime and pick best strategy.
         """
@@ -358,7 +358,7 @@ class StrategySelector:
             h4 = self.bridge.get_historical_data(symbol, 'H4', 30)
         except Exception:
             return None
-        
+
         # Determine strategy
         if strategy_hint and strategy_hint in self.strategies:
             strategy = self.strategies[strategy_hint]
@@ -370,18 +370,6 @@ class StrategySelector:
                 strategy = self.strategies.get(best_strat, self.strategies['ict_ob_fvg'])
             else:
                 strategy = self.strategies['ict_ob_fvg']
-        
+
         # Run analysis
         return strategy.detect_setup(symbol, direction, m15, h1, h4)
-'''
-
-with open('/mnt/agents/output/strategies/strategy_selector.py', 'w') as f:
-    f.write(strategy_selector_code)
-
-print("✅ strategy_selector.py created - 380 lines")
-print("   Scores each strategy-signal combination using 4 factors:")
-print("   - Regime fit (40%): Strategy must match market conditions")
-print("   - Signal quality (25%): Grade, confidence, R:R")
-print("   - Session fit (20%): Right time for strategy")
-print("   - Pair fit (15%): Right pair for strategy")
-print("   Returns ranked list of top 3 candidates")
