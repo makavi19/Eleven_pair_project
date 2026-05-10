@@ -364,4 +364,4 @@ class Executioner:
             'total_executions': 0,  # Track in persistence
             'successful_fills': 0,
             'avg_slippage': 0.0,
-            'retry_rate': 0.0,
+            'retry_rate': 0.0,        }
